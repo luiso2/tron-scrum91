@@ -1,0 +1,154 @@
+You are Codex, senior reviewer for the Merktop wallet team. This is the ELEVENTH design review of a Tron (Nile testnet) TRC-20 fee-estimation module. You REJECTed v10 with 0 P0, 3 P1, 1 P2. The team rewrote the design as v11 below, claiming to fix all three P1s with a time-based redesign grounded in Tron's maintenance-period activation rule. No code has been written.
+
+Facts verified live on Nile testnet (ground truth):
+- getEnergyFee=100 SUN/unit, getTransactionFee=1000 SUN/byte, getMaxFeeLimit=15,000,000,000 SUN, getAllowDynamicEnergy=1, getDynamicEnergyMaxFactor=34000, getDynamicEnergyThreshold=5000000000, getDynamicEnergyIncreaseFactor=2000 (all read from GET /wallet/getchainparameters on nile.trongrid.io).
+- getcontractinfo raw JSON contains ZERO mentions of "factor".
+- Estimators on the same transfer call, reproducibly: /wallet/estimateenergy -> energy_required=21527; /wallet/triggerconstantcontract -> energy_used=14351.
+- Official Tron docs: finalEnergy = baseUnits x (1 + energy_factor); energy_factor starts at 0, max_factor=3.4 on mainnet; fee_limit (0..15e9 sun) caps ONLY caller Energy; exceeding fee_limit fails execution but still consumes resources (bounded by fee_limit); OUT_OF_TIME can exhaust the full energy budget; bandwidth is consumed whether execution succeeds or fails; bandwidth billing = serialized signed transaction with ret cleared + 64 bytes result allowance.
+- triggerconstantcontract returns a full unsigned transaction whose raw_data contains ref_block_bytes, ref_block_hash, expiration, timestamp, and a fee_limit field.
+- Measured: unsigned TriggerSmartContract = 205 bytes; ~272 bytes signed.
+
+THE V11 FIXES (each maps to one v10 finding):
+
+P1-1 (v10: "Post-quotation proposals remain outside the claimed upper bound") -> v11 abandons predicting proposal values entirely and uses the protocol rule: Tron committee parameter changes (including transactionFeeSun and energyFeeSun) take effect ONLY at maintenance-period boundaries (interval maintenanceIntervalMs from chain params, ~6h). The quote is taken at SOLIDIFIED block H_q with consensus timestamp T_q. nextMaintenanceTimeMs = the smallest maintenance boundary strictly greater than T_q = ((T_q // maintenanceIntervalMs) + 1) x maintenanceIntervalMs, computed from on-chain values at H_q. pricingHorizonMs = nextMaintenanceTimeMs - marginMs (explicit margin, e.g. 60000 ms, versioned in policy). The transaction's raw_data.expiration must satisfy txExpirationMs < pricingHorizonMs (strict; equality rejected). CONSEQUENCE: no proposal — pending, approved-not-yet-effective, or CREATED AFTER QUOTATION — can activate during [T_q, txExpirationMs], because every activation occurs at a boundary >= nextMaintenanceTimeMs > txExpirationMs. Therefore transactionFeeUpperBoundSun = currentFeeSun (the value at H_q, re-verified against staleness). No empirical estimate remains. If the requested validity would exceed the horizon, the quoter shortens expiration or rejects the quote (tron_no_pricing_horizon). The implementation MUST verify the maintenance-boundary activation rule from authoritative sources at H_q; if unverifiable -> fail closed (tron_governance_data_unavailable). Mapping of the reviewer's required elements: proposal lifecycle/approval/activation for future proposals -> all collapse into "every activation is at a boundary >= nextMaintenanceTimeMs"; solidity lag -> H_q solidified; policy margin -> explicit versioned marginMs.
+
+P1-2 (v10: "The timestamp-to-block validity relationship is unspecified and unenforceable") -> v11 has NO timestamp-to-block conversion: everything lives in the consensus time domain (milliseconds). nextMaintenanceTimeMs derives from the solidified block header timestamp (chain time, not local clock); raw_data.expiration is compared directly: txExpirationMs < pricingHorizonMs. Block production speed is irrelevant because maintenance boundaries are time-based. Boundary semantics explicit (equality rejected). Reorganization risk on T_q is eliminated by requiring H_q solidified; timestamp jitter is covered by marginMs. Fail closed on non-solidified H_q or unreadable maintenanceIntervalMs.
+
+P1-3 (v10: "The supplied feeDerivationId is not the claimed auditable content identifier") -> v11 makes feeDerivationId a domain-separated cryptographic digest COMPUTED BY THE GENERATOR: sha256("TRONFEEDERIVEv1" || quoteBlockHeight || quoteBlockTimestampMs || maintenanceIntervalMs || nextMaintenanceTimeMs || marginMs || currentFeeSun || proposalSnapshotHash || sponsorPolicyVersion). Every derivation input is ALSO bound as a separate typed preimage field (37-43: quoteBlockHeight, quoteBlockTimestampMs, maintenanceIntervalMs, nextMaintenanceTimeMs, marginMs, currentFeeSun u64be; proposalSnapshotHash = 32-byte digest of the canonical proposal-set serialization, lpref). Mutating any input changes the digest and the authorization. The generator additionally performs SEMANTIC validation (not just byte-pushing): asserts the boundary formula, asserts pricingHorizonMs == nextMaintenanceTimeMs - marginMs, asserts txExpirationMs < pricingHorizonMs strictly (when present), asserts every proposal's effectiveTimeMs >= nextMaintenanceTimeMs (the protocol rule), and asserts transactionFeeUpperBoundSun == currentFeeSun. Fixtures carry real computed identifiers. Required mutation tests for every derivation input are specified.
+
+Previously closed and not reopened: the (S+64) x provenFeeUpperBound bandwidth structure (v8 P1-1); the explicit EXPIRED predicate with BROADCAST/INDETERMINATE coherence (v8 P1-3); the intact generator with literal hex/length/digest assertions (v8 P1-4, independently reconstructed by the reviewer); FX dimensions (v7 P1-1); replacement reservation separation (v7 P1-2); signed-envelope binding (v7 P1-5); per-message allowlist + 68-byte ABI rule (v7 P1-6); in-parser depth + member caps (v7 P2-1). Unchanged: chain-sourced dynamic bound with fail-closed (P0); Nile-only / genesis verification / TRON_ENABLED / existing-RPC-only / no-signing/no-broadcast guarantees.
+
+RUNNABLE GENERATOR SOURCE (gen_binding_vectors.py — executes as-is; verified 2026-09-28):
+#!/usr/bin/env python3
+import hashlib, struct, json
+def u16be(n):
+    assert 0 <= n <= 0xFFFF, n
+    return struct.pack('>H', n)
+def u64be(n):
+    assert 0 <= n <= 2**64 - 1, n
+    return struct.pack('>Q', n)
+def lpref(b):
+    return u16be(len(b)) + b
+def valid_hex(s):
+    assert isinstance(s, str) and len(s) % 2 == 0, s
+    assert all(c in '0123456789abcdef' for c in s), s
+    return bytes.fromhex(s)
+def opt_bytes(b):
+    return b'\x00' if b is None else b'\x01' + b
+def opt_u64(n):
+    return b'\x00' if n is None else b'\x01' + u64be(n)
+def domain_digest(domain, parts):
+    h = hashlib.sha256(); h.update(domain)
+    for part in parts: h.update(part)
+    return h.digest()
+def proposal_snapshot_hash(proposals):
+    parts = [struct.pack('>I', len(proposals))]
+    for pr in sorted(proposals, key=lambda x: x['id']):
+        parts.append(struct.pack('>Q', pr['id'])); parts.append(u64be(pr['proposedFeeSun'])); parts.append(u64be(pr['effectiveTimeMs'])); parts.append(pr['state'].encode('utf-8'))
+    return domain_digest(b'TRONFEEPROPOSALSv1', parts)
+def fee_derivation_id(q, proposal_hash):
+    return domain_digest(b'TRONFEEDERIVEv1', [u64be(q['quoteBlockHeight']), u64be(q['quoteBlockTimestampMs']), u64be(q['maintenanceIntervalMs']), u64be(q['nextMaintenanceTimeMs']), u64be(q['marginMs']), u64be(q['currentFeeSun']), proposal_hash, q['sponsorPolicyVersion'].encode('utf-8')])
+def build_preimage(q):
+    p = b''
+    p += lpref(b'TRC20FEEv1')
+    for k in ('from', 'to', 'contract'):
+        raw = valid_hex(q[k])
+        assert len(raw) == 21, k
+        p += lpref(raw)
+    p += lpref(q['amountRaw'].encode('utf-8'))
+    for k in ('conservativeEnergyUnits', 'worstCaseEnergyUnits', 'maxFactorBps'):
+        p += u64be(q[k])
+    p += lpref(q['boundSource'].encode('utf-8'))
+    for k in ('energyFeeSun', 'transactionFeeSun', 'energyFeeLimitSun', 'bandwidthReservationSun', 'maxTotalDebitSun', 'byteAllowance'):
+        p += u64be(q[k])
+    assert 0 <= q['callerSharePercent'] <= 100
+    p += u16be(q['callerSharePercent'])
+    p += lpref(q['txShape'].encode('utf-8'))
+    p += opt_u64(q['policyFeeCents'])
+    p += u64be(q['quotedAtMs'])
+    p += u64be(q['maxAgeMs'])
+    p += opt_bytes(valid_hex(q['refBlockHash']) if q['refBlockHash'] else None)
+    assert q['refBlockHash'] is None or len(valid_hex(q['refBlockHash'])) == 8
+    p += opt_bytes(valid_hex(q['refBlockBytes']) if q['refBlockBytes'] else None)
+    assert q['refBlockBytes'] is None or len(valid_hex(q['refBlockBytes'])) == 2
+    p += opt_u64(q['txExpirationMs'])
+    p += opt_u64(q['txTimestampMs'])
+    p += lpref(b'nile')
+    p += opt_bytes(lpref(q['unsignedRawDataHex'].encode('utf-8')) if q['unsignedRawDataHex'] else None)
+    if q['unsignedRawDataHex']:
+        valid_hex(q['unsignedRawDataHex'])
+    p += u64be(q['simulationBlockHeight'])
+    sim_hash = valid_hex(q['simulationBlockHash'])
+    assert len(sim_hash) == 32
+    p += lpref(sim_hash)
+    p += u64be(q['quotedSuccessCostSun'])
+    p += u64be(q['policyFeeSun'])
+    p += lpref(q['fxId'].encode('utf-8'))
+    p += u64be(q['fxSunPerCent'])
+    p += lpref(q['sponsorPolicyVersion'].encode('utf-8'))
+    p += u64be(q['transactionFeeUpperBoundSun'])
+    p += u64be(q['pricingHorizonMs'])
+    assert q['maintenanceIntervalMs'] > 0
+    assert q['marginMs'] > 0
+    assert q['nextMaintenanceTimeMs'] == ((q['quoteBlockTimestampMs'] // q['maintenanceIntervalMs']) + 1) * q['maintenanceIntervalMs'], 'not the next maintenance boundary'
+    assert q['pricingHorizonMs'] == q['nextMaintenanceTimeMs'] - q['marginMs']
+    if q['txExpirationMs'] is not None:
+        assert q['txExpirationMs'] < q['pricingHorizonMs'], 'expiration must be strictly before the pricing horizon'
+    prop_hash = proposal_snapshot_hash(q['proposals'])
+    deriv_id = fee_derivation_id(q, prop_hash)
+    for pr in q['proposals']:
+        assert pr['effectiveTimeMs'] >= q['nextMaintenanceTimeMs'], 'protocol rule: proposals activate only at maintenance boundaries'
+    assert q['transactionFeeUpperBoundSun'] == q['currentFeeSun'], 'no proposal can activate before the horizon: bound == current fee'
+    p += lpref(deriv_id)
+    p += u64be(q['quoteBlockHeight'])
+    p += u64be(q['quoteBlockTimestampMs'])
+    p += u64be(q['maintenanceIntervalMs'])
+    p += u64be(q['nextMaintenanceTimeMs'])
+    p += u64be(q['marginMs'])
+    p += u64be(q['currentFeeSun'])
+    p += lpref(prop_hash)
+    return p
+V1 = {'from': '41'*21, 'to': '42'*21, 'contract': '43'*21, 'amountRaw': '1000000', 'conservativeEnergyUnits': 21527, 'worstCaseEnergyUnits': 94719, 'maxFactorBps': 34000, 'boundSource': 'chain', 'energyFeeSun': 100, 'transactionFeeSun': 1000, 'energyFeeLimitSun': 9471900, 'bandwidthReservationSun': 350000, 'maxTotalDebitSun': 9821900, 'byteAllowance': 350, 'callerSharePercent': 100, 'txShape': 'trc20-transfer-single-sig', 'policyFeeCents': 10, 'quotedAtMs': 1759000000000, 'maxAgeMs': 120000, 'refBlockHash': 'ab'*8, 'refBlockBytes': 'cd'*2, 'txExpirationMs': 1759000120000, 'txTimestampMs': 1759000000000, 'unsignedRawDataHex': 'deadbeef', 'simulationBlockHeight': 12345678, 'simulationBlockHash': 'ef'*32, 'quotedSuccessCostSun': 9921900, 'policyFeeSun': 100000, 'fxId': 'test-fx-v1', 'fxSunPerCent': 10000, 'sponsorPolicyVersion': 'sp-1', 'transactionFeeUpperBoundSun': 1000, 'pricingHorizonMs': 1759017540000, 'quoteBlockHeight': 12345678, 'quoteBlockTimestampMs': 1759000000000, 'maintenanceIntervalMs': 21600000, 'nextMaintenanceTimeMs': 1759017600000, 'marginMs': 60000, 'currentFeeSun': 1000, 'proposals': []}
+V2 = {'from': '41'*21, 'to': '42'*21, 'contract': '43'*21, 'amountRaw': '0', 'conservativeEnergyUnits': 14351, 'worstCaseEnergyUnits': 63145, 'maxFactorBps': 34000, 'boundSource': 'chain', 'energyFeeSun': 100, 'transactionFeeSun': 1000, 'energyFeeLimitSun': 6314500, 'bandwidthReservationSun': 350000, 'maxTotalDebitSun': 6664500, 'byteAllowance': 350, 'callerSharePercent': 100, 'txShape': 'trc20-transfer-single-sig', 'policyFeeCents': None, 'quotedAtMs': 1759000000000, 'maxAgeMs': 120000, 'refBlockHash': None, 'refBlockBytes': None, 'txExpirationMs': None, 'txTimestampMs': None, 'unsignedRawDataHex': None, 'simulationBlockHeight': 12345670, 'simulationBlockHash': '12'*32, 'quotedSuccessCostSun': 6664500, 'policyFeeSun': 0, 'fxId': 'test-fx-v1', 'fxSunPerCent': 10000, 'sponsorPolicyVersion': 'sp-1', 'transactionFeeUpperBoundSun': 1000, 'pricingHorizonMs': 1759017540000, 'quoteBlockHeight': 12345670, 'quoteBlockTimestampMs': 1759000000000, 'maintenanceIntervalMs': 21600000, 'nextMaintenanceTimeMs': 1759017600000, 'marginMs': 60000, 'currentFeeSun': 1000, 'proposals': []}
+if __name__ == '__main__':
+    EXPECTED = {
+        'V1': {
+            'preimage_len': 486,
+            'sha256': '2206c076e53f4458498582ef996cc67b5535698a0efa48351b02b83aeec48734',
+            'preimage_hex': '000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000731303030303030000000000000541700000000000171ff00000000000084d00005636861696e000000000000006400000000000003e8000000000090879c0000000000055730000000000095decc000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696701000000000000000a000001998c91f600000000000001d4c001abababababababab01cdcd01000001998c93cac001000001998c91f60000046e696c6501000864656164626565660000000000bc614e0020efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef000000000097656c00000000000186a0000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a00020c654baa36aa6fcc299a647eeeeb06886af91888da0ffdf9e9fba071c6e87469d0000000000bc614e000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59',
+        },
+        'V2': {
+            'preimage_len': 436,
+            'sha256': 'dd59a1a0bc590edb0f6aa831ee9ee26aec53587aef5a84bed803dbba2c008687',
+            'preimage_hex': '000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000130000000000000380f000000000000f6a900000000000084d00005636861696e000000000000006400000000000003e80000000000605a040000000000055730000000000065b134000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696700000001998c91f600000000000001d4c00000000000046e696c65000000000000bc614600201212121212121212121212121212121212121212121212121212121212121212000000000065b1340000000000000000000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a000201d5194eac64f13a45a6a885158cfb129bbf9280fc83b9f6faf7c9568a57fb0950000000000bc6146000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59',
+        },
+    }
+    out = {}
+    for name, fix in (('V1', V1), ('V2', V2)):
+        pre = build_preimage(fix)
+        digest = hashlib.sha256(pre).hexdigest()
+        assert len(pre) == EXPECTED[name]['preimage_len'], (name, len(pre))
+        assert digest == EXPECTED[name]['sha256'], (name, digest)
+        assert pre.hex() == EXPECTED[name]['preimage_hex'], (name, 'hex mismatch')
+        out[name] = {'preimage_len': len(pre), 'preimage_hex': pre.hex(), 'sha256': digest}
+        print('--- %s ---' % name)
+        print('preimage_len:', len(pre))
+        print('preimage_hex:', pre.hex())
+        print('sha256:', digest)
+        print()
+    with open('binding_vectors.json', 'w') as f:
+        json.dump(out, f, indent=2)
+    print('wrote binding_vectors.json')
+    print('assertions passed: lengths, digests and preimage hex match pinned literals')
+V1 fixture economics check: worstCaseUnits(94719) x energyFeeSun(100) = 9471900 + bandwidthReservationSun(350000) + policyFeeSun(10 x 10000 = 100000) = quotedSuccessCostSun 9921900. V2: 63145x100=6314500 + 350000 + 0 = 6664500. V1/V2 fee horizon fixtures: quoteBlockHeight=12345678/12345670 (solidified), quoteBlockTimestampMs=1759000000000, maintenanceIntervalMs=21600000, nextMaintenanceTimeMs=1759017600000, marginMs=60000, pricingHorizonMs=1759017540000, currentFeeSun=1000=transactionFeeUpperBoundSun, proposals=[]; V1 txExpirationMs=1759000120000 < 1759017540000 strictly.
+
+VECTORS (44-field preimage; fields 1-28 as in the v6 table; 29 quotedSuccessCostSun u64be; 30 policyFeeSun u64be; 31 fxId UTF-8 u16be-prefixed; 32 fxSunPerCent u64be; 33 sponsorPolicyVersion UTF-8 u16be-prefixed; 34 transactionFeeUpperBoundSun u64be; 35 pricingHorizonMs u64be; 36 feeDerivationId = 32-byte domain-separated digest computed by the generator (lpref); 37 quoteBlockHeight u64be; 38 quoteBlockTimestampMs u64be; 39 maintenanceIntervalMs u64be; 40 nextMaintenanceTimeMs u64be; 41 marginMs u64be; 42 currentFeeSun u64be; 43 proposalSnapshotHash = 32-byte digest (lpref); 44 implicit semantic checks asserted by the generator; SHA-256, lowercase hex):
+VECTOR V1 (complete quote): preimage 486 bytes, sha256 2206c076e53f4458498582ef996cc67b5535698a0efa48351b02b83aeec48734, preimage hex:
+000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000731303030303030000000000000541700000000000171ff00000000000084d00005636861696e000000000000006400000000000003e8000000000090879c0000000000055730000000000095decc000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696701000000000000000a000001998c91f600000000000001d4c001abababababababab01cdcd01000001998c93cac001000001998c91f60000046e696c6501000864656164626565660000000000bc614e0020efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef000000000097656c00000000000186a0000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a00020c654baa36aa6fcc299a647eeeeb06886af91888da0ffdf9e9fba071c6e87469d0000000000bc614e000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59
+VECTOR V2 (display-only, nulls): preimage 436 bytes, sha256 dd59a1a0bc590edb0f6aa831ee9ee26aec53587aef5a84bed803dbba2c008687, preimage hex:
+000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000130000000000000380f000000000000f6a900000000000084d00005636861696e000000000000006400000000000003e80000000000605a040000000000055730000000000065b134000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696700000001998c91f600000000000001d4c00000000000046e696c65000000000000bc614600201212121212121212121212121212121212121212121212121212121212121212000000000065b1340000000000000000000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a000201d5194eac64f13a45a6a885158cfb129bbf9280fc83b9f6faf7c9568a57fb0950000000000bc6146000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59
+
+YOUR REVIEW TASK:
+- Verify each claimed v10-review fix actually fixes the finding. Hunt for NEW correctness bugs, security holes, economic attack vectors, and Tron-protocol misunderstandings in v11.
+- Check especially: (a) does the maintenance-boundary argument genuinely close the post-quotation-proposal hole — is "committee parameter changes take effect only at maintenance boundaries" a sound protocol invariant to rely on, and is the fail-closed verification requirement adequate; (b) is the pure time-domain horizon (no timestamp-to-block conversion) consensus-enforceable, including boundary semantics, solidity treatment, and clock assumptions; (c) is feeDerivationId now a genuine tamper-evident content identifier with all inputs bound as typed fields, and does the generator's semantic validation hold up; (d) does the intact generator with literal hex/length/digest assertions satisfy the executable-evidence gate — verify syntax, field order, presence tags, lengths, digests against the supplied hex; (e) anything weakening Nile-only / TRON_ENABLED / no-signing guarantees.
+- Reply with exactly one word first: APPROVE or REJECT. Then list every finding graded P0/P1/P2 with a one-paragraph explanation and the concrete fix required. If you approve, state "no blocking findings" explicitly and list non-blocking notes as P2.
