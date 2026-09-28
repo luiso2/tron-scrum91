@@ -1,6 +1,6 @@
-# SCRUM-91 — Diseño v11: motor de estimación de energía y fees TRC-20 (solo lectura)
+# SCRUM-91 — Diseño v12: motor de estimación de energía y fees TRC-20 (solo lectura)
 
-- **Estado:** BORRADOR v11 — pendiente de revisión por Codex. NO escribir código antes del `APPROVE`.
+- **Estado:** BORRADOR v12 — pendiente de revisión por Codex. NO escribir código antes del `APPROVE`.
 - **Fecha:** 2026-09-28. **Ticket:** [SCRUM-91](https://merktop.atlassian.net/browse/SCRUM-91)
   (padre SCRUM-87).
 - **Historial:** v1 → REJECT (3 P0, 7 P1, 3 P2). v2 → REJECT (1 P0, 9 P1, 2 P2).
@@ -8,14 +8,20 @@
   v5 → REJECT (0 P0, 5 P1, 2 P2). v6 → REJECT (0 P0, 5 P1, 2 P2).
   v7 → REJECT (0 P0, 7 P1, 1 P2). v8 → REJECT (0 P0, 4 P1, 0 P2).
   v9 → REJECT (0 P0, 1 P1, 0 P2). v10 → REJECT (0 P0, 3 P1, 1 P2).
-  Esta v11 corrige los 3 hallazgos de la décima revisión. Trazabilidad: §9
+  v11 → REJECT (0 P0, 2 P1, 1 P2) — revisión real contra el código de
+  java-tron: (P1) `nextMaintenanceTimeMs` no puede derivarse por redondeo
+  al epoch, (P1) la API incluía funciones de reserva/firma/broadcast fuera
+  del alcance "solo lectura", (P2) serialización de propuestas no
+  suficientemente estricta.
+  Esta v12 corrige los 3 hallazgos de la undécima revisión. Trazabilidad: §9
   (v2→v4), §10 (v4→v5), §11 (v5→v6), §12 (v6→v7), §13 (v7→v8), §14 (v8→v9),
-  §15 (v9→v10), §16 (v10→v11).
-- **Nota de honestidad (v10):** la respuesta no mostró insignia de modelo;
-  el selector/composer web no expone el nombre del modelo en la UI actual.
-  El revisor cerró el P1 de v9 y dejó 3 P1 nuevos, todos sobre la cota de
-  precio, con la pista clave: los cambios de gobernanza solo toman efecto
-  en boundaries de períodos de mantenimiento.
+  §15 (v9→v10), §16 (v10→v11), §17 (v11→v12). §18 = fase futura
+  (no implementable en SCRUM-91).
+- **Nota de honestidad (v11):** la UI de Codex no mostró insignia de modelo
+  en esta ronda; no puede confirmarse que el revisor fuera Astra. El
+  veredicto se tomó como válido para continuar el loop por orden de Jose
+  ("Soluciónalo"), pero el mandato de revisión por Astra sigue pendiente
+  de evidencia.
 
 ## 0. Base heredada (cerrado, sin cambios)
 
@@ -29,6 +35,21 @@
   con vectores reproducibles; `E` post-stake; `maxNestingDepth`.
 - Garantías intactas: Nile-only, verificación de génesis, `TRON_ENABLED`,
   solo-RPC-existente, sin firma ni broadcast.
+- **Alcance v12 (cierre del P1-2 de v11):** SCRUM-91 es estrictamente un
+  módulo de **lectura, estimación, binding y validación de frescura**. Toda
+  la maquinaria de patrocinio/reserva/firma/submit/broadcast descrita en
+  versiones anteriores (§1 P1-2/P1-4/P1-5 de v7, §4, §6, §7) se mueve a §18
+  **fase futura — no implementable en SCRUM-91** (requiere su propio ticket
+  y su propia revisión). El módulo v12 **no** exporta
+  `reserveSponsorCapacity`, máquina de estados de intentos, ni
+  `finalGateBuild`; no depende de ningún signer/broadcaster; con
+  `TRON_ENABLED` ausente o falso **toda** RPC de Tron está prohibida
+  (fail-closed `tron_disabled`, verificado por tests que afirman cero
+  llamadas RPC). El aislamiento respecto a las integraciones Tron
+  existentes y limitadas del wallet (p. ej. observación de portafolio) es
+  explícito: el módulo de fees no comparte estado ni clientes RPC con
+  ellas. La capacidad de Tron como payer de POS sigue declarada no
+  implementada; SCRUM-91 no la cambia.
 
 ## 1. Correcciones P1 (7)
 
@@ -53,6 +74,8 @@
   9921900`; vectores regenerados (§3).
 
 ### P1-2 (v7): un intento y su reserva quedan ligados a una única transacción firmada
+> **Alcance v12:** esta maquinaria (reserva, CAS, estados de intento) es **fase futura — §18**, no implementable en SCRUM-91.
+
 **Hallazgo:** un *replacement* tiene distinto `raw_data` (distinto txID);
 el original y el reemplazo pueden aceptarse ambos y consumir recursos, así
 que una reserva de "pérdida máxima" podía cubrir múltiples pérdidas reales.
@@ -111,77 +134,100 @@ horizonte de precios):**
   de la política aplica al ledger de fallos; el diseño lo declara
   explícitamente para que "tope diario" no sea ambiguo.
 
-**Horizonte de precios (v11 — rediseño time-based sobre maintenance boundaries):**
-la v10 seguía vulnerable en tres puntos: (a) propuestas creadas *después*
-de la cotización quedaban fuera del escaneo; (b) el horizonte en bloques no
-se relacionaba con la expiración en timestamp de forma exigible por
-consenso; (c) `feeDerivationId` era una constante, no un identificador de
-contenido. Resolución v11 — el diseño deja de predecir valores de
-propuestas y usa la regla de protocolo:
+**Horizonte de precios (v12 — boundary autoritativo leído de cadena; cierre
+del P1-1 de v11):** la v11 derivaba `nextMaintenanceTimeMs` por redondeo al
+Unix epoch (`((T_q // intervalo) + 1) × intervalo`). Esa fórmula es
+incorrecta: java-tron persiste `NEXT_MAINTENANCE_TIME` como estado
+independiente y lo avanza desde el límite vigente
+(`DynamicPropertiesStore.updateNextMaintenanceTime`: si el tiempo de bloque
+≥ `nextMaintenanceTime`, nuevo valor = `nextMaintenanceTime + (round + 1) ×
+intervalo`); además `MAINTENANCE_TIME_INTERVAL` puede cambiar por gobernanza
+(`ProposalService`), de modo que la fase de los boundaries está anclada al
+historial, no al epoch. La v12 elimina la fórmula y usa el valor
+autoritativo:
 
 1. **Regla de protocolo (invariante verificable):** en Tron, los cambios de
    parámetros del comité —incluidos `transactionFeeSun` (precio de
    bandwidth) y `energyFeeSun`— toman efecto **únicamente en los boundaries
-   de los períodos de mantenimiento** (intervalo `maintenanceIntervalMs`
-   leído de chain params; ~6h). La implementación DEBE verificar esta regla
-   en fuentes autoritativas a la altura de cotización; si no puede
+   de los períodos de mantenimiento**. La implementación DEBE verificar esta
+   regla en fuentes autoritativas a la altura de cotización; si no puede
    verificarse → fail-closed (`tron_governance_data_unavailable`). Sin esta
    regla no hay cota finita.
 2. **Cotización sobre bloque solidificado:** `H_q` solidificado, con su
    timestamp de consenso `T_q` (del header, no del reloj local — la
    solidificación elimina el riesgo de reorganización sobre `T_q`).
-3. `nextMaintenanceTimeMs` = el menor boundary de mantenimiento
-   estrictamente mayor que `T_q`, computado como
-   `((T_q // maintenanceIntervalMs) + 1) × maintenanceIntervalMs` con los
-   valores leídos en cadena a `H_q`.
-4. `pricingHorizonMs = nextMaintenanceTimeMs − marginMs` (margen explícito,
+3. `nextMaintenanceTimeMs` = **valor leído de
+   `DynamicPropertiesStore.NEXT_MAINTENANCE_TIME` a la altura `H_q`**
+   (superficie RPC estándar del full node), **comprobado cruzado entre ≥2
+   endpoints de full node independientes** (igualdad exacta). No se deriva,
+   no se redondea, no se interpola.
+4. **Invariante de protocolo comprobable por el cotizador** (sin conocer el
+   historial): `T_q < nextMaintenanceTimeMs ≤ T_q + maintenanceIntervalMs`
+   — el próximo boundary cae estrictamente después de `T_q` y como máximo
+   un intervalo después. Si no se cumple → fail-closed
+   (`tron_governance_data_unavailable`).
+5. `pricingHorizonMs = nextMaintenanceTimeMs − marginMs` (margen explícito,
    p. ej. 60_000 ms, versionado en la política; cubre jitter de
    timestamps).
-5. **La expiración de la transacción (`raw_data.expiration`, timestamp en
+6. **La expiración de la transacción (`raw_data.expiration`, timestamp en
    ms) debe ser estrictamente anterior al horizonte:**
    `txExpirationMs < pricingHorizonMs`. Semántica de borde explícita: la
    igualdad NO basta → rechazo. No hay conversión timestamp→bloque: todo
    vive en el dominio temporal del consenso; la velocidad de producción de
    bloques es irrelevante porque los boundaries de mantenimiento son
    time-based.
-6. **Consecuencia:** ninguna propuesta —pendiente, aprobada-no-efectiva o
+7. **Consecuencia:** ninguna propuesta —pendiente, aprobada-no-efectiva o
    **creada después de la cotización**— puede activarse durante
    `[T_q, txExpirationMs]`, porque toda activación ocurre en un boundary ≥
    `nextMaintenanceTimeMs > txExpirationMs`. Por tanto
    `transactionFeeUpperBoundSun = currentFeeSun` (el valor vigente a `H_q`,
    re-verificado contra staleness). No hay estimación empírica.
-7. Si la validez solicitada excedería el horizonte → se acorta la
+8. Si la validez solicitada excedería el horizonte → se acorta la
    expiración o se rechaza la cotización (`tron_no_pricing_horizon`).
    Fail-closed también si `maintenanceIntervalMs` no es legible, si `H_q`
-   no está solidificado, o si los datos están stale/inconsistentes.
-8. **Binding (preimagen de 44 campos, §3):** la cota (34), el horizonte en
+   no está solidificado, si `NEXT_MAINTENANCE_TIME` no es legible o
+   diverge entre fuentes, o si los datos están stale/inconsistentes.
+9. **Binding (preimagen de 44 campos, §3):** la cota (34), el horizonte en
    ms (35), y como campos tipados separados: `quoteBlockHeight` (37),
    `quoteBlockTimestampMs` (38), `maintenanceIntervalMs` (39),
-   `nextMaintenanceTimeMs` (40), `marginMs` (41), `currentFeeSun` (42),
-   `proposalSnapshotHash` (43, digest del set canónico de propuestas).
-   `feeDerivationId` (36) es ahora un **digest criptográfico con dominio
-   separado** `sha256("TRONFEEDERIVEv1" || H_q || T_q || intervalo ||
-   nextMaintenance || margen || currentFee || proposalSnapshotHash ||
-   sponsorPolicyVersion)`, **computado por el generador** desde los inputs
-   (no un literal): mutar cualquier input cambia el digest y la
-   autorización. El generador además valida semánticamente: boundary
-   correcto, `horizonte = next − margen`, `expiración < horizonte`
-   estricto, y que ninguna propuesta tenga `effectiveTimeMs` anterior al
-   próximo boundary.
-9. Mapeo explícito de los requisitos del revisor: lifecycle/aprobación/
-   activación de propuestas futuras → colapsan en "toda activación es en un
-   boundary ≥ nextMaintenanceTimeMs"; solidity lag → `H_q` solidificado;
-   policy margin → `marginMs` explícito y versionado.
+   `nextMaintenanceTimeMs` (40, **valor autoritativo de cadena**),
+   `marginMs` (41), `currentFeeSun` (42),
+   `proposalSnapshotHash` (43, digest del set canónico de propuestas con
+   codificación estricta v12) y **`nextMaintenanceTimeSource` (44,
+   procedencia con prefijo de longitud, p. ej.
+   `chain:getchainparameters@H=12345678+crosscheck:2of2`)**.
+   `feeDerivationId` (36) es un **digest criptográfico con dominio
+   separado** `sha256("TRONFEEDERIVEv2" || H_q || T_q || intervalo ||
+   nextMaintenance || source ‖ margen || currentFee || proposalSnapshotHash
+   || sponsorPolicyVersion)` — **todos los inputs con delimitación de
+   longitud** — **computado por el generador** desde los inputs (no un
+   literal): mutar cualquier input cambia el digest. El generador además
+   valida semánticamente: invariante `T_q < next ≤ T_q + intervalo`,
+   `horizonte = next − margen`, `expiración < horizonte` estricto, y que
+   toda propuesta tenga `effectiveTimeMs` en un boundary de mantenimiento
+   futuro real (`(eff − next) % intervalo == 0`).
+10. Mapeo explícito de los requisitos del revisor: lifecycle/aprobación/
+    activación de propuestas futuras → colapsan en "toda activación es en un
+    boundary ≥ nextMaintenanceTimeMs"; solidity lag → `H_q` solidificado;
+    policy margin → `marginMs` explícito y versionado; fuente y valor
+    probados → ligados al identificador (campo 44 + digest v2).
 
 - Tests requeridos: propuesta creada/aprobada después de la cotización (la
   tx expira antes de que pueda activarse); activación exactamente en el
   borde (igualdad → rechazo); cambio 1000→2000 SUN/byte entre cotización e
   inclusión con boundary intermedio → la cotización se rechaza o se acorta
   (no se emite con horizonte inválido); mutación de cada input de la
-  derivación → `feeDerivationId` distinto; `maintenanceIntervalMs`
-  ilegible → fail-closed; `H_q` no solidificado → fail-closed.
+  derivación → `feeDerivationId` distinto (10 mutaciones en el generador);
+  `maintenanceIntervalMs` ilegible → fail-closed; `H_q` no solidificado →
+  fail-closed; `NEXT_MAINTENANCE_TIME` ilegible o divergente entre fuentes
+  → fail-closed; invariante `T_q < next ≤ T_q + intervalo` violado →
+  fail-closed; vector V3 con cambio histórico de intervalo 6h→3h donde la
+  fórmula v11 de redondeo al epoch da un boundary **erróneo por 100
+  minutos** (1759006800000 vs el autoritativo 1759000800000).
 
 ### P1-4 (v7): un cambio de política no puede invalidar una transacción ya enviada
+> **Alcance v12:** predicado EXPIRED y retención de reservas son **fase futura — §18**, no implementables en SCRUM-91.
+
 **Hallazgo:** un broadcast indeterminado puede estar ya en el mempool o en
 cadena; invalidar su reserva por un rollover de política liberaría fondos
 que aún pueden consumirse.
@@ -208,6 +254,8 @@ que aún pueden consumirse.
   expiración local → ni liberación de reserva ni camino (b) disponibles.
 
 ### P1-5 (v7): la validación post-firma cubre el envelope completo
+> **Alcance v12:** validación de envelope firmado y broadcast son **fase futura — §18**; en SCRUM-91 la validación de schema/ABI aplica al input **sin firmar** que se estima.
+
 **Hallazgo:** verificar solo `raw_data` byte-por-byte no cubre `signature`
 ni `ret` del envelope; el conteo de firmas cambia el costo de bandwidth.
 
@@ -291,133 +339,212 @@ documentos playos con un string/objeto/array gigante.
   payloads playos anchos (objeto con `maxContainerMembers+1` claves,
   array gigante, string en el límite).
 
-## 3. Vectores de binding v11 (preimagen de 44 campos)
+## 3. Vectores de binding v12 (preimagen de 44 campos reales)
 
 Campos 1–28: tabla v5/v6 sin cambios. Campos 29–33: `quotedSuccessCostSun`
 (u64be), `policyFeeSun` (u64be), `fxId` (UTF-8, prefijo u16be),
 `fxSunPerCent` (u64be), `sponsorPolicyVersion` (UTF-8, prefijo u16be).
 Campo 34: `transactionFeeUpperBoundSun` (u64be). Campo 35:
 `pricingHorizonMs` (u64be, timestamp en ms). Campo 36: `feeDerivationId`
-(digest de 32 bytes con dominio `TRONFEEDERIVEv1`, prefijo u16be —
-**computado por el generador** desde los campos 37–43 + versión de
-política, no un literal). Campos 37–42: `quoteBlockHeight`,
-`quoteBlockTimestampMs`, `maintenanceIntervalMs`, `nextMaintenanceTimeMs`,
+(digest de 32 bytes con dominio **`TRONFEEDERIVEv2`**, prefijo u16be —
+**computado por el generador** desde los campos 37–44, todos con
+delimitación de longitud explícita, no un literal). Campos 37–42:
+`quoteBlockHeight`, `quoteBlockTimestampMs`, `maintenanceIntervalMs`,
+`nextMaintenanceTimeMs` (**valor autoritativo de cadena**, no derivado),
 `marginMs`, `currentFeeSun` (todos u64be). Campo 43:
-`proposalSnapshotHash` (digest de 32 bytes del set canónico de propuestas,
-prefijo u16be — computado por el generador). Campo 44: verificación
-implícita — el generador afirma `pricingHorizonMs =
-nextMaintenanceTimeMs − marginMs`, boundary correcto,
-`txExpirationMs < pricingHorizonMs` estricto y
+`proposalSnapshotHash` (digest de 32 bytes del set de propuestas con
+**codificación canónica estricta v12**, dominio `TRONFEEPROPOSALSv2`,
+prefijo u16be — computado por el generador). Campo 44:
+`nextMaintenanceTimeSource` (UTF-8, prefijo u16be — procedencia del valor
+autoritativo, p. ej. `chain:getchainparameters@H=12345678+crosscheck:2of2`).
+El generador afirma el invariante `T_q < nextMaintenanceTimeMs ≤ T_q +
+maintenanceIntervalMs`, `pricingHorizonMs = nextMaintenanceTimeMs −
+marginMs`, `txExpirationMs < pricingHorizonMs` estricto y
 `transactionFeeUpperBoundSun = currentFeeSun`. Digest SHA-256, hex
 minúsculas. Generador: `gen_binding_vectors.py` (assertions de longitud +
-digest + preimagen hex contra literales pinneados **más** validación
-semántica de la derivación; corre en CI).
+digest + preimagen hex contra literales pinneados, **más** 10 mutation
+tests que cambian `feeDerivationId` y 10 casos negativos rechazados;
+corre en CI).
+
+**Codificación canónica de propuestas (cierre del P2 de v11):**
+`u32be(count)` + por propuesta ordenada por id: `u64be(proposalId)`,
+`u64be(paramId)`, `u64be(paramValue)`, `u64be(effectiveTimeMs)`,
+`u8(stateId)` con enum numérico pinneado al commit de java-tron en CI
+(`PENDING=0, DISAPPROVED=1, APPROVED=2, CANCELED=3` según
+`ProposalCapsule.State`). Solo se aceptan parámetros que afectan al fee:
+`paramId ∈ {3: TRANSACTION_FEE, 11: ENERGY_FEE}` (pinneado a
+`ProposalService` en CI). Se rechaza: IDs duplicados, estados
+desconocidos, parámetros ajenos, `effectiveTimeMs < nextMaintenanceTimeMs`
+y tiempos efectivos que no caen en un boundary real
+(`(eff − next) % intervalo ≠ 0` → rechazo).
 
 - **V1** (completa; `policyFeeSun = 10 × 10000 = 100000`;
   `quotedSuccessCostSun = 9471900 + 350000 + 100000 = 9921900`;
   `quoteBlockHeight = 12345678`, `quoteBlockTimestampMs = 1759000000000`,
   `maintenanceIntervalMs = 21600000`,
-  `nextMaintenanceTimeMs = 1759017600000`, `marginMs = 60000`,
-  `pricingHorizonMs = 1759017540000`, `currentFeeSun = 1000`,
-  `transactionFeeUpperBoundSun = 1000`, `proposals = []`):
-  preimagen **486 bytes** →
-  `sha256 = 2206c076e53f4458498582ef996cc67b5535698a0efa48351b02b83aeec48734`
-  preimagen hex:
-  `000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000731303030303030000000000000541700000000000171ff00000000000084d00005636861696e000000000000006400000000000003e8000000000090879c0000000000055730000000000095decc000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696701000000000000000a000001998c91f600000000000001d4c001abababababababab01cdcd01000001998c93cac001000001998c91f60000046e696c6501000864656164626565660000000000bc614e0020efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef000000000097656c00000000000186a0000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a00020c654baa36aa6fcc299a647eeeeb06886af91888da0ffdf9e9fba071c6e87469d0000000000bc614e000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59`
+  `nextMaintenanceTimeMs = 1759017600000` **(valor autoritativo de cadena,
+  tratado como input — ya no se deriva por redondeo)**,
+  `nextMaintenanceTimeSource =
+  "chain:getchainparameters@H=12345678+crosscheck:2of2"`,
+  `marginMs = 60000`, `pricingHorizonMs = 1759017540000`,
+  `currentFeeSun = 1000`, `transactionFeeUpperBoundSun = 1000`,
+  `proposals = []`):
+  preimagen **539 bytes** →
+  `sha256 = b144e411fb336f639c7ea2ae3fccf8a3f3818325a9c6f96231aa509546b619a1`
 - **V2** (display-only, nulls; `policyFeeSun = 0`;
   `quotedSuccessCostSun = 6314500 + 350000 = 6664500`; mismos parámetros
   de horizonte que V1 salvo `quoteBlockHeight = 12345670`):
-  preimagen **436 bytes** →
-  `sha256 = dd59a1a0bc590edb0f6aa831ee9ee26aec53587aef5a84bed803dbba2c008687`
-  preimagen hex:
-  `000a54524332304645457631001541414141414141414141414141414141414141414100154242424242424242424242424242424242424242420015434343434343434343434343434343434343434343000130000000000000380f000000000000f6a900000000000084d00005636861696e000000000000006400000000000003e80000000000605a040000000000055730000000000065b134000000000000015e0064001974726332302d7472616e736665722d73696e676c652d73696700000001998c91f600000000000001d4c00000000000046e696c65000000000000bc614600201212121212121212121212121212121212121212121212121212121212121212000000000065b1340000000000000000000a746573742d66782d76310000000000002710000473702d3100000000000003e8000001998d9d99a000201d5194eac64f13a45a6a885158cfb129bbf9280fc83b9f6faf7c9568a57fb0950000000000bc6146000001998c91f6000000000001499700000001998d9e8400000000000000ea6000000000000003e80020ce252b0dddf9a6af84daa326f38185288d5cf0b397a891bb6f40362910f7ae59`
+  preimagen **489 bytes** →
+  `sha256 = ac9b84e8afe6538e50e1a54e97fac53748a0f2782f4e1ed213ad74d699483efd`
+- **V3** (cambio histórico de intervalo 6h→3h; demuestra el P1-1 de v11:
+  `quoteBlockHeight = 12345679`, `quoteBlockTimestampMs = 1759000000000`,
+  `maintenanceIntervalMs = 10800000`,
+  `nextMaintenanceTimeMs = 1759000800000` **autoritativo**,
+  `nextMaintenanceTimeSource =
+  "chain:getchainparameters@H=12345679+crosscheck:2of2"`,
+  `pricingHorizonMs = 1759000740000`, una propuesta
+  `{id: 7, paramId: 3 (TRANSACTION_FEE), paramValue: 2000,
+  effectiveTimeMs: 1759000800000, state: APPROVED}` con tiempo efectivo
+  exactamente en el próximo boundary. La fórmula v11 de redondeo al epoch
+  habría dado `((1759000000000 // 10800000) + 1) × 10800000 =
+  1759006800000` — **erróneo por 6,000,000 ms (100 minutos)** — porque la
+  fase real está anclada al último boundary del régimen anterior
+  (1758990000000) avanzado en pasos de 3h, no al epoch):
+  preimagen **539 bytes** →
+  `sha256 = 2228960959afac973daa051df21997280b5ebaa0f462b92a2aea8674e5979f48`
 
-## 4. API final (`src/lib/tron/fees.ts`)
+Las preimágenes hex completas están pinneadas como literales en
+`gen_binding_vectors.py` y en `binding_vectors.json` (regenerado v12).
+
+## 4. API final (`src/lib/tron/fees.ts`) — v12: solo lectura/estimación
+
+**Alcance estricto (cierre del P1-2 de v11):** este módulo exporta
+únicamente lecturas, estimación, binding y validación de frescura. **No**
+exporta reserva de capacidad, máquina de estados de intentos, firma,
+construcción de envelope firmado ni broadcast — todo eso vive en §18
+(fase futura, no implementable en SCRUM-91). El módulo no importa ningún
+signer/broadcaster; con `TRON_ENABLED` ausente o falso, **toda** llamada
+falla con `tron_disabled` antes de cualquier RPC.
 
 ```ts
 getTronChainParameters(config?) → { /* v9, sin cambios */ }
 deriveFeeHorizon({ quoteBlockHeight, config }) → {
-  // v11: lee maintenanceIntervalMs + timestamp del bloque SOLIDIFICADO H_q;
+  // v12: lee maintenanceIntervalMs + timestamp del bloque SOLIDIFICADO H_q;
+  // lee NEXT_MAINTENANCE_TIME autoritativo de DynamicPropertiesStore a H_q
+  // y lo comprueba cruzado entre ≥2 full nodes (igualdad exacta);
   // verifica la regla "activaciones solo en maintenance boundaries" en
-  // fuentes autoritativas; computa nextMaintenanceTimeMs y pricingHorizonMs.
+  // fuentes autoritativas; afirma T_q < next ≤ T_q + intervalo;
+  // computa pricingHorizonMs = nextMaintenanceTimeMs − marginMs.
   // Capacidades RPC requeridas: (a) chain params a una altura; (b) header
-  // con timestamp de un bloque solidificado; (c) prueba de solidez.
-  // Si algo no es probable → tron_governance_data_unavailable (fail-closed).
+  // con timestamp de un bloque solidificado; (c) prueba de solidez;
+  // (d) NEXT_MAINTENANCE_TIME a H_q en ≥2 fuentes independientes.
+  // Si algo no es probable o diverge → tron_governance_data_unavailable
+  // (fail-closed). NUNCA deriva el boundary por redondeo al epoch.
   transactionFeeUpperBoundSun /* = currentFeeSun */,
-  pricingHorizonMs, nextMaintenanceTimeMs, marginMs,
-  quoteBlockTimestampMs, maintenanceIntervalMs, currentFeeSun,
+  pricingHorizonMs, nextMaintenanceTimeMs, nextMaintenanceTimeSource,
+  marginMs, quoteBlockTimestampMs, maintenanceIntervalMs, currentFeeSun,
   proposalSnapshotHash, feeDerivationId
 }
 estimateTrc20TransferEnergy(input) → { /* v9, sin cambios */ }
 quoteTrc20TransferFee({from, to, contract, amountRaw, policy?, config?}) → {
   /* v9, con policyFeeSun = policyFeeCents × fxSunPerCent (sin división);
-     v11: exige txExpirationMs < pricingHorizonMs (estricto; igualdad =
+     v12: exige txExpirationMs < pricingHorizonMs (estricto; igualdad =
      rechazo); si la validez pedida excede el horizonte → acortar o
      tron_no_pricing_horizon */
-  authorizationRecord: AuthorizationRecord, // §1 v9 + §1 v11
-  bindingHash: string  // preimagen v11 §3 (44 campos)
+  quote: FeeQuote,        // estimación + cota + horizonte + binding (sin autoridad económica)
+  bindingHash: string     // preimagen v12 §3 (44 campos)
 }
 isFeeQuoteFresh(quote, nowMs?) → boolean
-isQuoteBuildReady(quote, nowMs?, freshParams) → boolean
-reserveSponsorCapacity(quote) → { reserved: true, attemptId } | { error }
-  // reserva atómica; intento ligado a un único txID (§1 P1-2)
-attemptStateMachine.transition(attemptId, from, to) // CAS durable (§1 P1-2);
-  // estados: AUTHORIZED → RESERVED → SUBMITTING → {BROADCAST|INDETERMINATE}
-  // → TERMINAL{CONFIRMED,FAILED,EXPIRED}; EXPIRED exige el predicado §1 P1-4
-finalGateBuild(quote, authorization, config) → { finalBytes, newQuote } | { abort: reason }
-  // envelope firmado completo verificado + digest persistido (§1 P1-5);
-  // broadcast de exactamente esos bytes tras CAS a SUBMITTING;
-  // expiration ≤ pricingHorizonEnd (§1 P1-3)
 ```
+
+Movido a §18 (fase futura, fuera de SCRUM-91): `isQuoteBuildReady`,
+`reserveSponsorCapacity`, `attemptStateMachine`,
+`finalGateBuild`.
 
 Errores: los de v9 + `tron_governance_data_unavailable`,
 `tron_amount_overflow`, `tron_uncomputable_bound`,
 `tron_no_pricing_horizon`, `tron_ledger_conflict`, `tron_abi_mismatch`,
 `tron_schema_violation` (ya), `tron_replacement_forbidden`.
 
-## 5. Seguridad (invariantes v11)
+## 5. Seguridad (invariantes v12)
 
 Todo lo de v9 más: la cota de precio ya no estima nada — `txExpirationMs <
 pricingHorizonMs` estricto con `pricingHorizonMs = nextMaintenanceTimeMs −
-marginMs`, donde los cambios de gobernanza solo toman efecto en
-boundaries de mantenimiento (regla de protocolo verificada o fail-closed);
-`transactionFeeUpperBoundSun = currentFeeSun`; sin conversión
-timestamp→bloque (todo en tiempo de consenso); `feeDerivationId` es un
-digest computado desde inputs tipados ligados (preimagen de 44 campos,
-§3); el generador valida semánticamente la derivación.
+marginMs`, donde `nextMaintenanceTimeMs` es el **valor autoritativo leído
+de `DynamicPropertiesStore.NEXT_MAINTENANCE_TIME` a `H_q`** (comprobado
+cruzado entre ≥2 full nodes; invariante `T_q < next ≤ T_q + intervalo`
+afirmado; **prohibido** derivarlo por redondeo al epoch) y los cambios de
+gobernanza solo toman efecto en boundaries de mantenimiento (regla de
+protocolo verificada o fail-closed); `transactionFeeUpperBoundSun =
+currentFeeSun`; sin conversión timestamp→bloque (todo en tiempo de
+consenso); `feeDerivationId` es un digest computado (dominio
+`TRONFEEDERIVEv2`) desde inputs tipados ligados con delimitación de
+longitud, incluida la procedencia del boundary (campo 44); el generador
+valida semánticamente la derivación y ejecuta mutation tests reales.
 
-## 6. Tests (`tests/wallet/tron-fees.test.ts`)
+Invariantes de aislamiento v12 (cierre del P1-2 de v11):
+- El módulo **no** contiene ni importa código de firma, construcción de
+  envelopes firmados o broadcast. Test estático: el grafo de imports de
+  `src/lib/tron/fees.ts` no puede alcanzar ningún módulo signer/broadcaster.
+- `TRON_ENABLED` ausente o falso → **toda** función del módulo falla con
+  `tron_disabled` antes de cualquier RPC. Test: con RPC mockeado que
+  cuenta llamadas, cero llamadas tras N invocaciones.
+- El módulo no comparte clientes RPC ni estado con las integraciones Tron
+  existentes del wallet (observación de portafolio, etc.).
+- Nile-only con verificación de génesis; la capacidad de Tron como payer
+  de POS sigue no implementada y SCRUM-91 no la cambia.
+
+## 6. Tests (`tests/wallet/tron-fees.test.ts`) — v12
 
 Lo de v7 más: vectores dimensionales FX (`(100,33333)→3333300`,
-`(1,1)→1`, `(0,x)→0`, overflow → `tron_amount_overflow`); reemplazo con
-mismo `attemptId` pero bytes distintos → `tron_replacement_forbidden` (o
-nueva reserva según política); transiciones CAS inválidas rechazadas;
-`actual > reserva` en reconciliación → halt; reserva liberada por rollover
-de política en `INDETERMINATE` → prohibido (test); envelope con `ret`
-presente / firma extra / campo exterior desconocido → rechazo; `provider`,
+`(1,1)→1`, `(0,x)→0`, overflow → `tron_amount_overflow`); envelope con
+`ret` presente / firma extra / campo exterior desconocido → rechazo
+(validación del input **sin firmar** que se estima); `provider`,
 `ContractName`, `auths`, `scripts` presentes-pero-vacíos → rechazo;
 calldata de 67/69 bytes o padding no cero → `tron_abi_mismatch`;
-anidamiento 32/33; contenedor con `maxContainerMembers+1`; vectores V1/V2
-v8/v9 desde el generador con literales (longitud + digest + hex);
+anidamiento 32/33; contenedor con `maxContainerMembers+1`; vectores
+V1/V2/V3 v12 desde el generador con literales (longitud + digest + hex);
 bandwidth: recursos agotados + tamaño firmado máximo + presupuesto de
-energía del caller consumido íntegro → `actual ≤ reserva`; horizonte de
-precios: propuesta creada/aprobada después de la cotización → la tx expira
-antes de que pueda activarse; activación exactamente en el borde
-(igualdad → rechazo); cambio 1000→2000 SUN/byte con boundary intermedio →
-cotización rechazada o acortada; mutación de cada input de la derivación →
-`feeDerivationId` distinto; `maintenanceIntervalMs` ilegible o `H_q` no
-solidificado → fail-closed; fuente RPC con historial incompleto devuelve
-`{}` tras expiración local → sin liberación ni camino (b).
+energía del caller consumido íntegro → `actual ≤ reserva` (cota de
+estimación, sin reserva real — la reserva es §18); horizonte de precios:
+propuesta creada/aprobada después de la cotización → la tx expira antes
+de que pueda activarse; activación exactamente en el borde (igualdad →
+rechazo); cambio 1000→2000 SUN/byte con boundary intermedio → cotización
+rechazada o acortada; mutación de cada input de la derivación →
+`feeDerivationId` distinto (10 mutaciones en el generador);
+`maintenanceIntervalMs` ilegible o `H_q` no solidificado → fail-closed;
+`NEXT_MAINTENANCE_TIME` ilegible o divergente entre fuentes →
+fail-closed; invariante `T_q < next ≤ T_q + intervalo` violado →
+fail-closed; V3: la fórmula v11 de redondeo habría dado 1759006800000
+(erróneo) vs el autoritativo 1759000800000; propuestas: ID duplicado,
+estado desconocido, parámetro ajeno (p. ej. 99), `effectiveTimeMs`
+anterior al próximo boundary, tiempo efectivo fuera de la grilla de
+boundaries → rechazo (10 casos negativos en el generador).
+
+Tests de aislamiento v12 (cierre del P1-2 de v11):
+- Grafo de imports: `src/lib/tron/fees.ts` no alcanza ningún módulo
+  signer/broadcaster (test estático).
+- `TRON_ENABLED` ausente / `false` / `"0"` → toda función exportada lanza
+  `tron_disabled` **antes** de cualquier RPC (RPC mock con contador de
+  llamadas = 0).
+- `deriveFeeHorizon` con fuentes RPC divergentes en
+  `NEXT_MAINTENANCE_TIME` → `tron_governance_data_unavailable`.
+
+Movido a §18 (fase futura): reemplazo con mismo `attemptId`,
+transiciones CAS, `actual > reserva` → halt, liberación por rollover en
+`INDETERMINATE`, fuente RPC con historial incompleto.
 
 ## 7. Decisiones para SCRUM-91 (tras APPROVE)
 
 1. Piloto = burn con la wallet operativa como caller (usuario sin TRX);
    staking diseñado, activación bloqueada por firma + umbral cuantitativo v8.
 2. Cota dinámica = `getDynamicEnergyMaxFactor` del nodo (`"chain"`), 4.4x hoy.
-3. `bindingHash` = detector de mismatch; autorización = `authorizationRecord`
-   con ledger diario, CAS durable y broadcast idempotente.
+3. `bindingHash` = detector de mismatch; la cotización v12 es estimación +
+   binding sin autoridad económica (la autorización con ledger/CAS es §18,
+   fase futura).
 4. Out-of-energy / OUT_OF_TIME = fallo posible con pérdida acotada por
-   `fee_limit`; la política del patrocinador la provisiona explícitamente.
+   `fee_limit`; la política del patrocinador la provisiona explícitamente
+   (§18).
 
 ## 8. Trazabilidad v2 → v4
 
@@ -515,3 +642,41 @@ original según la mejor reconstrucción.
 | P1-1 | propuestas creadas después de `H_q` quedaban fuera de la cota | §1: rediseño time-based — los cambios de gobernanza solo toman efecto en boundaries de mantenimiento; `txExpirationMs < nextMaintenanceTimeMs − marginMs` estricto ⇒ ninguna propuesta (ni futura) puede activarse durante la vida de la tx; `transactionFeeUpperBoundSun = currentFeeSun`; validez que exceda el horizonte → acortar o rechazar | test: propuesta post-cotización; la tx expira antes de su posible activación |
 | P1-2 | relación timestamp→bloque del horizonte sin especificar ni exigible | §1: sin conversión — todo en tiempo de consenso (ms): `nextMaintenanceTimeMs` desde el timestamp del bloque solidificado `H_q`; `raw_data.expiration < pricingHorizonMs`; boundaries time-based ⇒ velocidad de bloques irrelevante; borde explícito (igualdad = rechazo); reorg cubierto por `H_q` solidificado | tests de borde y de `H_q` no solidificado → fail-closed |
 | P1-3 | `feeDerivationId` era la constante `gov-scan-v1`, no un identificador de contenido | §3: `feeDerivationId` = digest `sha256("TRONFEEDERIVEv1"‖…)` **computado por el generador**; inputs como campos tipados 37–43; el generador valida semánticamente (boundary, `horizonte = next − margen`, `expiración < horizonte`, `cota = currentFee`) | tests de mutación por cada input; fixtures con identificadores reales |
+
+## 17. Trazabilidad v11 → v12 (los 3 hallazgos de la undécima revisión)
+
+| # | Hallazgo v11 | v12 (§) | Cierre |
+|---|--------------|---------|--------|
+| P1-1 | `nextMaintenanceTimeMs` derivado con fase de mantenimiento no demostrada: la fórmula de redondeo al epoch `((T_q // intervalo) + 1) × intervalo` no coincide con el estado de consenso de java-tron (`NEXT_MAINTENANCE_TIME` persistido, avanzado desde el límite vigente; el intervalo puede cambiar por gobernanza) | §1: fórmula **eliminada**; `nextMaintenanceTimeMs` = valor autoritativo leído de `DynamicPropertiesStore.NEXT_MAINTENANCE_TIME` a `H_q`, comprobado cruzado entre ≥2 full nodes, con invariante comprobable `T_q < next ≤ T_q + intervalo`; procedencia ligada al identificador (campo 44 + dominio `TRONFEEDERIVEv2`); referencias: `DynamicPropertiesStore.updateNextMaintenanceTime`, `ProposalService` | tests: `NEXT_MAINTENANCE_TIME` ilegible/divergente → fail-closed; invariante violado → fail-closed; vector V3 con cambio histórico 6h→3h donde la fórmula v11 erra por 100 minutos (1759006800000 vs 1759000800000 autoritativo) |
+| P1-2 | la API propuesta contradice el alcance "solo lectura / sin firma / sin broadcast": incluía `reserveSponsorCapacity`, estados `SUBMITTING`/`BROADCAST` y `finalGateBuild` (envelope firmado + emisión de bytes) | §0/§4/§5/§6/§7: alcance estricto — el módulo exporta solo lecturas, estimación, binding y validación de frescura; `reserveSponsorCapacity`, `attemptStateMachine`, `finalGateBuild` e `isQuoteBuildReady` movidos a §18 (fase futura, no implementable en SCRUM-91); aislamiento explícito vs integraciones Tron existentes; Tron como payer de POS sigue no implementado | tests: grafo de imports sin signer/broadcaster; `TRON_ENABLED` ausente/falso → `tron_disabled` antes de cualquier RPC (cero llamadas); fuentes divergentes → `tron_governance_data_unavailable` |
+| P2 | `proposalSnapshotHash` sin serialización canónica suficientemente estricta: ordenaba por id pero no rechazaba duplicados, no validaba el parámetro, concatenaba `state` como UTF-8 sin prefijo/enum | §3: codificación tipada y totalmente delimitada (dominio `TRONFEEPROPOSALSv2`): `u32be(count)` + por propuesta `u64be(id)`, `u64be(paramId)`, `u64be(value)`, `u64be(effectiveTimeMs)`, `u8(stateId)` con enum numérico pinneado a `ProposalCapsule.State`; solo `paramId ∈ {3: TRANSACTION_FEE, 11: ENERGY_FEE}`; rechaza IDs duplicados, estados desconocidos, parámetros ajenos y tiempos efectivos fuera de la grilla de boundaries | 10 casos negativos en el generador + mutation tests reales (10 mutaciones cambian `feeDerivationId`) |
+
+## 18. Fase futura — NO implementable en SCRUM-91 (requiere su propio ticket y revisión)
+
+**Advertencia de alcance:** todo lo listado aquí es contexto de diseño para
+una fase posterior. **Ninguna** de estas funciones, máquinas de estado o
+invariantes pertenece al entregable de SCRUM-91 ni puede implementarse bajo
+su aprobación. Implementar cualquiera de estos ítems sin una revisión
+Codex dedicada de esa fase violaría el alcance aprobado.
+
+- `reserveSponsorCapacity(quote)` — reserva atómica de capacidad del
+  patrocinador; intento ligado a un único txID.
+- `attemptStateMachine.transition(attemptId, from, to)` — CAS durable con
+  estados `AUTHORIZED → RESERVED → SUBMITTING → {BROADCAST|INDETERMINATE} →
+  TERMINAL{CONFIRMED,FAILED,EXPIRED}`; predicado `EXPIRED` explícito
+  (ventana solidificada + cobertura verificada + txID ausente).
+- `finalGateBuild(quote, authorization, config)` — verificación del
+  envelope firmado completo, digest de bytes firmados persistido, broadcast
+  de exactamente esos bytes tras CAS a `SUBMITTING`.
+- `isQuoteBuildReady(quote, nowMs?, freshParams)` — compuerta de
+  construcción con snapshot verificado-contra-génesis.
+- `authorizationRecord` con ledger diario durable, reserve/commit/release e
+  idempotencia; reglas de reemplazo (`tron_replacement_forbidden`);
+  reconciliación desde receipts autoritativos; halt ante `actual > reserva`.
+- Invariantes económicos del patrocinador: `maxFailedAttemptLossSun`,
+  ledgers separados de fallos vs éxito, topes diarios con pausa automática.
+
+Referencia histórica: el detalle de estos mecanismos se conserva en las
+resoluciones §1 P1-2/P1-3/P1-4/P1-5 (v7) y §1 P1-1/P1-3 (v8) de este
+documento; se listan aquí únicamente para delimitar lo que SCRUM-91 **no**
+cubre.
